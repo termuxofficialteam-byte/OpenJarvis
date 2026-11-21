@@ -1,0 +1,298 @@
+"""Tests for file sensitivity policy."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from openjarvis.security.file_policy import filter_sensitive_paths, is_sensitive_file
+
+
+@pytest.fixture(params=["default", "python"])
+def policy_backend(request, monkeypatch):
+    if request.param == "python":
+
+        def unavailable():
+            raise ImportError("exercise the Python fallback")
+
+        monkeypatch.setattr("openjarvis._rust_bridge.get_rust_module", unavailable)
+
+
+class TestIsSensitiveFile:
+    def test_sensitive_env(self) -> None:
+        assert is_sensitive_file(".env") is True
+
+    def test_sensitive_env_local(self) -> None:
+        assert is_sensitive_file(".env.local") is True
+
+    def test_sensitive_pem(self) -> None:
+        assert is_sensitive_file("server.pem") is True
+
+    def test_sensitive_key(self) -> None:
+        assert is_sensitive_file("private.key") is True
+
+    def test_sensitive_id_rsa(self) -> None:
+        assert is_sensitive_file("id_rsa") is True
+
+    def test_sensitive_credentials(self) -> None:
+        assert is_sensitive_file("credentials.json") is True
+
+    def test_sensitive_htpasswd(self) -> None:
+        assert is_sensitive_file(".htpasswd") is True
+
+    def test_sensitive_pgpass(self) -> None:
+        assert is_sensitive_file(".pgpass") is True
+
+    def test_sensitive_netrc(self) -> None:
+        assert is_sensitive_file(".netrc") is True
+
+    def test_sensitive_p12(self) -> None:
+        assert is_sensitive_file("cert.p12") is True
+
+    def test_sensitive_pfx(self) -> None:
+        assert is_sensitive_file("cert.pfx") is True
+
+    def test_sensitive_jks(self) -> None:
+        assert is_sensitive_file("keystore.jks") is True
+
+    def test_sensitive_id_ed25519(self) -> None:
+        assert is_sensitive_file("id_ed25519") is True
+
+    def test_sensitive_secret(self) -> None:
+        assert is_sensitive_file(".secret") is True
+
+    def test_sensitive_env_in_path(self) -> None:
+        assert is_sensitive_file(Path("/some/dir/.env")) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "pass.txt",
+            "password.txt",
+            "passwords.txt",
+            "shadow",
+            "gshadow",
+            "credentials",
+            ".git-credentials",
+        ],
+    )
+    def test_sensitive_plaintext_credential_files(
+        self, name: str, policy_backend: None
+    ) -> None:
+        assert is_sensitive_file(Path("/srv/app") / name) is True
+
+    def test_not_sensitive_py(self) -> None:
+        assert is_sensitive_file("main.py") is False
+
+    def test_not_sensitive_txt(self) -> None:
+        assert is_sensitive_file("readme.txt") is False
+
+    def test_not_sensitive_toml(self) -> None:
+        assert is_sensitive_file("pyproject.toml") is False
+
+    def test_not_sensitive_json(self) -> None:
+        assert is_sensitive_file("package.json") is False
+
+    def test_path_object(self) -> None:
+        assert is_sensitive_file(Path("server.pem")) is True
+        assert is_sensitive_file(Path("main.py")) is False
+
+    @pytest.mark.parametrize(
+        "sensitive_name", [".env", "credentials.json", "server.pem"]
+    )
+    def test_sensitive_symlink_alias(self, tmp_path: Path, sensitive_name: str) -> None:
+        sensitive = tmp_path / sensitive_name
+        sensitive.write_text("SENSITIVE-SENTINEL", encoding="utf-8")
+        alias = tmp_path / "notes.txt"
+        try:
+            alias.symlink_to(sensitive)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is True
+
+    def test_sensitive_symlink_alias_to_missing_target(self, tmp_path: Path) -> None:
+        alias = tmp_path / "notes.txt"
+        try:
+            alias.symlink_to(tmp_path / ".env")
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is True
+
+    @pytest.mark.parametrize(
+        "sensitive_name", [".env", "credentials.json", "server.pem"]
+    )
+    @pytest.mark.parametrize("target_exists", [True, False])
+    def test_sensitive_symlink_name_to_ordinary_target(
+        self, tmp_path: Path, sensitive_name: str, target_exists: bool, policy_backend
+    ) -> None:
+        target = tmp_path / "notes.txt"
+        if target_exists:
+            target.write_text("SENSITIVE-SENTINEL", encoding="utf-8")
+        alias = tmp_path / sensitive_name
+        try:
+            alias.symlink_to(target.name)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is True
+
+    @pytest.mark.parametrize("target_name", [".env", "notes.txt"])
+    @pytest.mark.parametrize("target_exists", [True, False])
+    def test_relative_symlink_chain(
+        self, tmp_path: Path, target_name: str, target_exists: bool, policy_backend
+    ) -> None:
+        target = tmp_path / target_name
+        if target_exists:
+            target.write_text("SENTINEL", encoding="utf-8")
+        intermediate = tmp_path / "intermediate.txt"
+        alias = tmp_path / "alias.txt"
+        try:
+            intermediate.symlink_to(target.name)
+            alias.symlink_to(intermediate.name)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is (target_name == ".env")
+
+    def test_sensitive_symlink_loop(self, tmp_path: Path, policy_backend) -> None:
+        alias = tmp_path / ".env"
+        try:
+            alias.symlink_to(alias.name)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is True
+
+    @pytest.mark.parametrize("target_exists", [True, False])
+    def test_sensitive_intermediate_symlink_to_ordinary_target(
+        self, tmp_path: Path, target_exists: bool, policy_backend
+    ) -> None:
+        target = tmp_path / "notes.txt"
+        if target_exists:
+            target.write_text("SENTINEL", encoding="utf-8")
+        intermediate = tmp_path / ".env"
+        alias = tmp_path / "alias.txt"
+        try:
+            intermediate.symlink_to(target.name)
+            alias.symlink_to(intermediate.name)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert is_sensitive_file(alias) is True
+
+
+class TestFilterSensitivePaths:
+    def test_filter_sensitive_aliases(self, tmp_path: Path, policy_backend) -> None:
+        target = tmp_path / "notes.txt"
+        target.write_text("SENTINEL", encoding="utf-8")
+        protected_alias = tmp_path / ".env"
+        ordinary_alias = tmp_path / "alias.txt"
+        secret = tmp_path / "server.pem"
+        secret.write_text("SENTINEL", encoding="utf-8")
+        try:
+            protected_alias.symlink_to(target.name)
+            ordinary_alias.symlink_to(secret.name)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        assert filter_sensitive_paths([protected_alias, ordinary_alias, target]) == [
+            target
+        ]
+
+    def test_filter_sensitive_paths(self) -> None:
+        paths = [
+            "main.py",
+            ".env",
+            "server.pem",
+            "readme.txt",
+            "credentials.json",
+            "app.js",
+        ]
+        filtered = filter_sensitive_paths(paths)
+        names = [p.name for p in filtered]
+        assert "main.py" in names
+        assert "readme.txt" in names
+        assert "app.js" in names
+        assert ".env" not in names
+        assert "server.pem" not in names
+        assert "credentials.json" not in names
+
+    def test_filter_all_sensitive(self) -> None:
+        paths = [".env", "server.pem", "credentials.json"]
+        filtered = filter_sensitive_paths(paths)
+        assert filtered == []
+
+    def test_filter_none_sensitive(self) -> None:
+        paths = ["main.py", "app.js", "readme.txt"]
+        filtered = filter_sensitive_paths(paths)
+        assert len(filtered) == 3
+
+    def test_filter_empty(self) -> None:
+        assert filter_sensitive_paths([]) == []
+
+
+class TestCaseInsensitiveAndExtraNames:
+    """Regression: matching was case-sensitive and missed common secret files.
+
+    Runs against both the default backend and the pure-Python fallback.
+    """
+
+    NAMES = [
+        ".ENV",
+        "Id_Rsa",
+        "server.PEM",
+        ".Env.Local",
+        "id_ecdsa",
+        "id_dsa",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+        ".npmrc",
+        ".pypirc",
+        "vault.KDBX",
+        "production.env",
+        "PRODUCTION.ENV",
+        "id_rsa::$DATA",
+        ".npmrc.",
+        ".pypirc ",
+        "vault.kdbx:backup:$DATA",
+        "normal:secret.pem",
+    ]
+    SAFE = [
+        "environment.py",
+        "README.md",
+        "id_rsa.pub",
+        "keyboard.py",
+        "production.env.example",
+        ".npmrc.example",
+        "id_rsa.pub::$DATA",
+    ]
+
+    def _check(self) -> None:
+        for name in self.NAMES:
+            assert is_sensitive_file(f"/srv/app/{name}") is True, name
+        for name in self.SAFE:
+            assert is_sensitive_file(f"/srv/app/{name}") is False, name
+
+    def test_default_backend(self) -> None:
+        self._check()
+
+    def test_python_fallback(self, monkeypatch) -> None:
+        def unavailable():
+            raise ImportError("exercise the Python fallback")
+
+        monkeypatch.setattr("openjarvis._rust_bridge.get_rust_module", unavailable)
+        self._check()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Win32 filename aliases")
+@pytest.mark.parametrize("suffix", ["::$DATA", ".", " "])
+def test_windows_aliases_of_secret_files_are_blocked(tmp_path, policy_backend, suffix):
+    secret = tmp_path / "id_ecdsa_sk"
+    secret.write_bytes(b"not-a-real-key")
+    alias = Path(str(secret) + suffix)
+    assert alias.read_bytes() == secret.read_bytes()
+    assert is_sensitive_file(alias)
